@@ -1,0 +1,15 @@
+name = "tempahcourt-uptime"
+# Pinned deliberately: this machine also holds a wrangler login for a DIFFERENT
+# Cloudflare account (oxfordquraniccentre), and deploying to the wrong account
+# would not error.
+account_id = "PUT-YOUR-CLOUDFLARE-ACCOUNT-ID-HERE"
+main = "src/index.js"
+compatibility_date = "2026-09-01"
+
+# Every five minutes. Cloudflare's cron actually fires, unlike GitHub's.
+[triggers]
+crons = ["*/5 * * * *"]
+
+# ⛔ No [vars] block on purpose. Vars and secrets share ONE namespace, so
+# declaring TELEGRAM_CHAT_ID here would silently overwrite the stored secret on
+# the next deploy. Both TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID are secrets.
