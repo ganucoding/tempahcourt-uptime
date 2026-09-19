@@ -1,0 +1,108 @@
+name: uptime
+
+# Watches https://tempahcourt.com from outside the machine that serves it.
+#
+# Everything else that watches that application runs ON its droplet: the alert
+# rail, ops:health, the scheduler. If the droplet dies they all die with it and
+# nobody is told, which is the one outage a monitor exists to catch. This runs
+# on GitHub's infrastructure instead, so it survives the thing it watches.
+#
+# ⛔ THIS REPOSITORY IS PUBLIC ON PURPOSE, AND THE REASON IS BILLING.
+# GitHub bills a MINIMUM OF ONE MINUTE PER JOB, so an eight-second probe at
+# */5 costs 288 minutes a day -- about 8,640 a month, against a 2,000-minute
+# monthly free tier that applies to PRIVATE repositories only. Public
+# repositories get unmetered Actions minutes. The probe reads a public URL and
+# holds no secrets, so it has no business consuming a private budget that the
+# application's own test suite needs. Do not move this file into a private
+# repository; disable it instead.
+#
+# /up is not a static route. The listener registered in the application makes
+# it run `select 1` against MySQL and write to the cache, so a 200 carrying
+# "Application up" means the app, the database and Redis are all alive.
+# Asserting on that string rather than on the status code is deliberate:
+# Cloudflare, a catch-all route or a parked page can all answer 200 for a site
+# that is not actually serving.
+#
+# GitHub's scheduler is best-effort and drops or delays runs under load, so
+# treat this as "you will hear within ~15 minutes", not as a second-by-second
+# pager. GitHub also disables scheduled workflows after 60 days with no
+# repository activity.
+
+on:
+  schedule:
+    # Every five minutes, offset off the hour because everything scheduled on
+    # the hour is queued and delayed.
+    - cron: '*/5 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: uptime
+  cancel-in-progress: false
+
+jobs:
+  probe:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Probe the public site
+        shell: bash
+        env:
+          URL: https://tempahcourt.com/up
+          NEEDLE: Application up
+        run: |
+          set -uo pipefail
+
+          # Three attempts over ~40s. One dropped packet is not an outage, and
+          # a monitor that cries wolf is a monitor somebody mutes.
+          for attempt in 1 2 3; do
+            # `|| var=default`, never `|| echo default`: curl -w and grep -c
+            # both PRINT a value and THEN exit non-zero, so `|| echo` appends a
+            # second one and you get "000000" / "0\n0", which makes the `[ -gt ]`
+            # below a syntax error rather than a comparison.
+            code=$(curl -sS -o /tmp/body.html -w '%{http_code}' --max-time 20 "$URL") || code=000
+            found=$(grep -cF "$NEEDLE" /tmp/body.html 2>/dev/null) || found=0
+
+            if [ "$code" = "200" ] && [ "$found" -gt 0 ]; then
+              echo "attempt $attempt: healthy (HTTP $code, found \"$NEEDLE\")"
+              exit 0
+            fi
+
+            echo "attempt $attempt: HTTP $code, \"$NEEDLE\" occurrences: $found"
+            if [ "$attempt" -lt 3 ]; then
+              sleep 20
+            fi
+          done
+
+          echo "::error::$URL did not answer HTTP 200 carrying \"$NEEDLE\" in three attempts over ~40s."
+          exit 1
+
+      - name: Tell a human
+        # The job failing is already a GitHub notification, but that depends on
+        # per-user Actions email settings. An issue is durable. Deduplicated on
+        # the exact title, so a sustained outage opens one issue rather than one
+        # every five minutes. Kept deliberately free of internal detail, because
+        # issues in this repository are public.
+        if: failure()
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TITLE: 'Uptime check failed: tempahcourt.com is not answering'
+        run: |
+          set -uo pipefail
+          existing=$(gh issue list --state open --search "in:title \"$TITLE\"" --json number --jq 'length')
+
+          if [ "${existing:-0}" -gt 0 ]; then
+            echo "An open issue already tracks this outage; not opening another."
+            exit 0
+          fi
+
+          gh issue create \
+            --title "$TITLE" \
+            --body "The scheduled probe could not reach https://tempahcourt.com/up in three attempts over ~40s.
+
+          Run: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+
+          Close this issue once the site is back; the check opens a fresh one if it happens again."
